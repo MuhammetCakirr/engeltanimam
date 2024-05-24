@@ -1,0 +1,1327 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:dio/dio.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:flutter_polyline_points/flutter_polyline_points.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:geolocator/geolocator.dart' as geo;
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:location/location.dart';
+import 'package:vibration/vibration.dart';
+
+import '../constants/app_colors.dart';
+import '../models/route_response_model.dart';
+
+class MapCubit extends Cubit<MapState> {
+  final String routeText;
+  GoogleMapController? mapController;
+  bool isLoading = true;
+  PolylinePoints polylinePoints = PolylinePoints();
+  String googleAPiKey = "AIzaSyBChasi4i5uXfZSnwh5mvZWIN-d8yV7cto";
+  StreamSubscription<LocationData>? locationSubscription;
+  StreamSubscription<geo.Position>? positionStreamSubscription;
+  LatLng? previousPosition;
+  Map<PolylineId, Polyline> polylines = {};
+  Set<Marker> allMarkers = {};
+  Set<Marker> markers = {};
+  LocationData? currentLocation;
+  BuildContext context;
+  AnimationController animationController;
+  RouteResponseModel? result;
+  bool isAlertShown = false;
+  String directionMessage = "";
+  double _currentBearing = 0;
+  final FlutterTts flutterTts = FlutterTts();
+
+  MapCubit(this.context, this.routeText, this.animationController)
+      : super(MapInitialState()) {
+    getCurrentLocation();
+  }
+
+  Future<void> followRouteSteps(List<RouteStepModel> steps) async {
+    for (final step in steps) {
+      print("step ${step.startLocation.latitude}");
+      await polyWalk(step.startLocation);
+      emit(MapStepsChangeState(step, polylinePoints));
+    }
+  }
+
+  Future<void> getRouteSteps(String origin, String destination) async {
+    const baseUrl = "https://maps.googleapis.com/maps/api/directions/json?";
+
+    final Dio dio = Dio();
+    final apiUrl =
+        "${baseUrl}origin=$origin&destination=$destination&mode=walking&language=tr&key=$googleAPiKey";
+    final response = await dio.get(apiUrl);
+    if (response.statusCode == 200) {
+      final responseData = response.data;
+      if (responseData != null && responseData['routes'].isNotEmpty) {
+        final legs = responseData['routes'][0]['legs'][0];
+
+        final distanceMetersLegs = legs['distance']['value'];
+        final durationSecondsLegs = legs['duration']['value'];
+
+        final arr = distanceAndDurationCalculator(
+            distanceMetersLegs, durationSecondsLegs);
+
+        final steps = responseData['routes'][0]['legs'][0]['steps'];
+        final stepsList = <RouteStepModel>[];
+        for (final step in steps) {
+          final stepModel = RouteStepModel.fromJson(step);
+          stepsList.add(stepModel);
+        }
+        result = RouteResponseModel(
+          distance: arr[0].toString(),
+          duration: arr[1].toString(),
+          steps: stepsList,
+        );
+        print(result!.steps.length);
+        emit(MapResultState(result!));
+        await followRouteSteps(result!.steps);
+        await _startTrackingUser();
+      } else {
+        print('error : Rota bulunamadı.');
+      }
+    } else {
+      print('error :API\'ye istek gönderilirken bir hata oluştu.');
+    }
+  }
+
+  Future<void> getRoute() async {
+    const baseUrl =
+        "https://maps.googleapis.com/maps/api/place/textsearch/json?";
+
+    final Dio dio = Dio();
+    print("${baseUrl}query=$routeText&key=$googleAPiKey");
+    final response = await dio.get(baseUrl, queryParameters: {
+      'query': routeText,
+      'key': googleAPiKey,
+    });
+    print(response.realUri.toString());
+
+    if (response.statusCode == 200) {
+      // API'den gelen yanıtı işleme
+      final responseData = response.data;
+      if (responseData != null && responseData['results'].isNotEmpty) {
+        final formattedAddress =
+            responseData['results'][0]['formatted_address'];
+        final location = responseData['results'][0]['geometry']['location'];
+        final result = {
+          "latitude": location['lat'],
+          "longitude": location['lng'],
+          "formatted_address": formattedAddress,
+        };
+
+        // JSON sonucunu ekrana yazdırma
+        print(jsonEncode(result));
+
+        // Yol oluşturma
+        addMarker(LatLng(location['lat'], location['lng']));
+        //await polyWalk(LatLng(location['lat'], location['lng']));
+        await _initPositionTracking();
+        await _zoomToRoute(
+          LatLng(currentLocation!.latitude!, currentLocation!.longitude!),
+        );
+        await getRouteSteps(
+            "${currentLocation!.latitude!},${currentLocation!.longitude!}",
+            "${location['lat']},${location['lng']}");
+      } else {
+        print(jsonEncode({"error": "Sonuç bulunamadı."}));
+      }
+    }
+  }
+
+  Future<void> _initPositionTracking() async {
+    try {
+      positionStreamSubscription = geo.Geolocator.getPositionStream(
+        locationSettings: const geo.LocationSettings(
+          accuracy: geo.LocationAccuracy.best, // geo. prefixini kaldırın
+          distanceFilter: 10, // metre cinsinden minimum hareket mesafesi
+        ),
+      ).listen((geo.Position position) async {
+        // Kullanıcının yeni konumu alındığında yönelimi güncelle
+        _currentBearing =
+            position.heading; // position.heading null kontrolü ekleyin
+      });
+    } catch (e) {
+      print("Position tracking error: $e");
+    }
+  }
+
+  Future<void> _showUserOffRouteAlert(LatLng currentPosition) async {
+    directionMessage = _calculateDirectionMessage(currentPosition);
+    Vibration.vibrate(duration: 500);
+
+    print(directionMessage);
+    emit(MapDirectionChange(directionMessage));
+    await _speak(directionMessage);
+  }
+
+  Future<void> _speak(String text) async {
+    await flutterTts.setLanguage("tr_TR");
+    await flutterTts.speak(text);
+    await flutterTts.awaitSpeakCompletion(true);
+  }
+
+  String _calculateDirectionMessage(LatLng currentPosition) {
+    if (polylines.isEmpty) return "No route available.";
+    if (previousPosition == null) return "Rotaya dönün.";
+
+    // Kullanıcının mevcut yönünü hesaplayın
+    double userBearing = geo.Geolocator.bearingBetween(
+      previousPosition!.latitude,
+      previousPosition!.longitude,
+      currentPosition.latitude,
+      currentPosition.longitude,
+    );
+
+    // En yakın noktayı bulun
+    LatLng nearestPoint = _findNearestPointOnRoute(currentPosition);
+
+    // Hedef noktaya olan yönü hesaplayın
+    double targetBearing = geo.Geolocator.bearingBetween(
+      currentPosition.latitude,
+      currentPosition.longitude,
+      nearestPoint.latitude,
+      nearestPoint.longitude,
+    );
+
+    // Yön farkını hesaplayın
+    double bearingDifference = targetBearing - userBearing;
+
+    // Yönlendirme mesajı oluşturun
+    if (bearingDifference.abs() < 20) {
+      return "Doğru yoldasınız, devam edin.";
+    } else if (bearingDifference > 0) {
+      if (bearingDifference > 45 && bearingDifference < 135) {
+        return "Sağa dönün.";
+      } else {
+        return "Doğru yoldan çıkıyorsunuz, sağa dönün.";
+      }
+    } else {
+      if (bearingDifference < -45 && bearingDifference > -135) {
+        return "Sola dönün.";
+      } else {
+        return "Doğru yoldan çıkıyorsunuz, sola dönün.";
+      }
+    }
+  }
+
+  LatLng _findNearestPointOnRoute(LatLng currentPosition) {
+    if (polylines.isEmpty) {
+      throw StateError("No polylines available");
+    }
+
+    LatLng nearestPoint = polylines.values.first.points.first;
+    double minDistance = double.infinity;
+
+    for (Polyline polyline in polylines.values) {
+      for (LatLng point in polyline.points) {
+        double distance = geo.Geolocator.distanceBetween(
+          currentPosition.latitude,
+          currentPosition.longitude,
+          point.latitude,
+          point.longitude,
+        );
+        if (distance < minDistance) {
+          minDistance = distance;
+          nearestPoint = point;
+        }
+      }
+    }
+
+    return nearestPoint;
+  }
+
+  Future<void> getCurrentLocation() async {
+    Location location = Location();
+    bool serviceEnabled;
+    PermissionStatus permissionGranted;
+
+    serviceEnabled = await location.serviceEnabled();
+    if (!serviceEnabled) {
+      serviceEnabled = await location.requestService();
+      if (!serviceEnabled) {
+        return;
+      }
+    }
+
+    permissionGranted = await location.hasPermission();
+    if (permissionGranted == PermissionStatus.denied) {
+      permissionGranted = await location.requestPermission();
+      if (permissionGranted != PermissionStatus.granted) {
+        return;
+      }
+    }
+
+    location.getLocation().then((value) async {
+      currentLocation = value;
+      emit(MapLocationState(currentLocation!));
+      changeLoadingView();
+      await getRoute();
+      emit(MapLoadingState(false));
+    });
+  }
+
+  Future<void> polyWalk(LatLng e) async {
+    List<LatLng> polylineCoordinates = [];
+
+    PolylineResult result = await polylinePoints.getRouteBetweenCoordinates(
+      googleAPiKey,
+      PointLatLng(currentLocation!.latitude!, currentLocation!.longitude!),
+      PointLatLng(e.latitude, e.longitude),
+      travelMode: TravelMode.walking,
+    );
+
+    if (result.points.isNotEmpty) {
+      for (var point in result.points) {
+        polylineCoordinates.add(LatLng(point.latitude, point.longitude));
+      }
+    } else {
+      //changeButtonText(false);
+    }
+    PolylineId id = const PolylineId("poly");
+    Polyline polyline = Polyline(
+      polylineId: id,
+      color: AppColors.headerTextColor,
+      points: polylineCoordinates,
+      jointType: JointType.round,
+      patterns: [PatternItem.dot, PatternItem.gap(10)],
+      width: 8,
+    );
+    polylines[id] = polyline;
+
+    // Son noktaya büyük bir marker ekleyelim
+    if (polylineCoordinates.isNotEmpty) {
+      LatLng lastPoint = polylineCoordinates.last;
+      Marker marker = Marker(
+        markerId: MarkerId("end_point"),
+        position: lastPoint,
+        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed),
+        // icon: await getCustomMarkerIcon("assets/large_marker.png"), // Eğer özel bir ikon kullanmak isterseniz
+        infoWindow: InfoWindow(
+          title: "End Point",
+          snippet: "${lastPoint.latitude}, ${lastPoint.longitude}",
+        ),
+      );
+
+      markers.add(marker);
+    }
+    return;
+  }
+
+  addPolyLine(List<LatLng> polylineCoordinates) {
+    PolylineId id = const PolylineId("poly");
+    Polyline polyline = Polyline(
+      polylineId: id,
+      color: AppColors.headerTextColor,
+      points: polylineCoordinates,
+      width: 8,
+    );
+    polylines[id] = polyline;
+  }
+
+  Future<BitmapDescriptor> getCustomMarkerIcon(String imagePath) async {
+    final ByteData byteData = await rootBundle.load(imagePath);
+    final Uint8List imageData = byteData.buffer.asUint8List();
+    return BitmapDescriptor.fromBytes(imageData);
+  }
+
+  Future<void> addMarker(LatLng position) async {
+    BitmapDescriptor icon = await getCustomMarkerIcon("assets/location.png");
+    Marker marker = Marker(
+      icon: icon,
+      markerId: MarkerId('${position.latitude}-${position.longitude}'),
+      position: position,
+      onTap: () {
+        removeMarker(MarkerId('${position.latitude}-${position.longitude}'));
+      },
+    );
+    markers.add(marker);
+    allMarkers.add(marker);
+  }
+
+  void removeMarker(MarkerId markerId) {
+    markers.removeWhere((element) => element.markerId == markerId);
+    allMarkers.removeWhere((element) => element.markerId == markerId);
+    polylines = {};
+    emit(MapRemoveMarkerState(polylines, markers));
+  }
+
+  void removeMarkerAll() {
+    allMarkers.removeAll(markers);
+    markers = {};
+    polylines = {};
+    emit(MapRemoveMarkerState(polylines, markers));
+  }
+
+  Future<void> _zoomToRoute(LatLng userPosition) async {
+    CameraPosition cameraPosition = CameraPosition(
+      target: userPosition,
+      zoom: 15, // Yakınlaştırma seviyesini ayarlayabilirsiniz
+      tilt: 30, // Kullanıcının bakış açısını temsil eden tilt değeri
+      bearing: _currentBearing,
+    );
+
+    // Haritayı hareket ettir
+    await mapController!
+        .animateCamera(CameraUpdate.newCameraPosition(cameraPosition));
+  }
+
+  Future<void> _startTrackingUser() async {
+    Location location = Location();
+    locationSubscription =
+        location.onLocationChanged.listen((locationData) async {
+      await _checkIfUserIsOffRoute(locationData);
+    });
+  }
+
+  List<dynamic> distanceAndDurationCalculator(
+      int distanceMeters, int durationSeconds) {
+    final distanceKilometers = distanceMeters / 1000;
+    final durationMinutes = (durationSeconds / 60).round();
+
+    return [distanceKilometers, durationMinutes];
+  }
+
+  String stripTags(String html) {
+    return html.replaceAll(RegExp(r'<[^>]*>'), '');
+  }
+
+  Future<void> _checkIfUserIsOffRoute(LocationData locationData) async {
+    LatLng currentPosition =
+        LatLng(locationData.latitude!, locationData.longitude!);
+    double distance = await _calculateDistanceToPolyline(currentPosition);
+
+    if (previousPosition != null) {
+      if (distance > 20) {
+        // 20 metre sapma toleransı
+        _showUserOffRouteAlert(currentPosition);
+      } else {
+        isAlertShown = false; // Sapma düzeltildiğinde bayrağı sıfırla
+      }
+      previousPosition = currentPosition;
+    } else {
+      previousPosition = currentPosition;
+    }
+  }
+
+  Future<double> _calculateDistanceToPolyline(LatLng position) async {
+    double minDistance = double.infinity;
+
+    for (Polyline polyline in polylines.values) {
+      for (LatLng point in polyline.points) {
+        double distance = geo.Geolocator.distanceBetween(
+          position.latitude,
+          position.longitude,
+          point.latitude,
+          point.longitude,
+        );
+        if (distance < minDistance) {
+          minDistance = distance;
+        }
+      }
+    }
+
+    return minDistance;
+  }
+
+  void changeLoadingView() {
+    isLoading = !isLoading;
+    emit(MapLoadingState(isLoading));
+  }
+
+  Future<void> mapsControllerInitalize(
+      GoogleMapController mapController) async {
+    this.mapController = mapController;
+  }
+}
+
+abstract class MapState {}
+
+class MapInitialState extends MapState {}
+
+class MapLoadingState extends MapState {
+  final bool isLoading;
+
+  MapLoadingState(this.isLoading);
+}
+
+class MapActiveState extends MapState {
+  final bool isLoading;
+
+  MapActiveState(this.isLoading);
+}
+
+class MapLocationState extends MapState {
+  final LocationData value;
+
+  MapLocationState(this.value);
+}
+
+class MapRemoveMarkerState extends MapState {
+  final Map<PolylineId, Polyline> polylines;
+  final Set<Marker> markers;
+
+  MapRemoveMarkerState(this.polylines, this.markers);
+}
+
+class MapResultState extends MapState {
+  final RouteResponseModel result;
+
+  MapResultState(this.result);
+}
+
+class MapDirectionChange extends MapState {
+  final String directionText;
+
+  MapDirectionChange(this.directionText);
+}
+
+class MapStepsChangeState extends MapState {
+  final RouteStepModel routeStepModel;
+  final PolylinePoints polylinePoints;
+
+  MapStepsChangeState(this.routeStepModel, this.polylinePoints);
+}
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+
+class RouteResponseModel {
+  final String distance;
+  final String duration;
+  final List<RouteStepModel> steps;
+
+  RouteResponseModel({
+    required this.distance,
+    required this.duration,
+    required this.steps,
+  });
+
+  factory RouteResponseModel.fromJson(Map<String, dynamic> json) {
+    return RouteResponseModel(
+      distance: json['distance'].toString(),
+      duration: json['duration'].toString(),
+      steps: List<RouteStepModel>.from(json['steps'].map((step) => RouteStepModel.fromJson(step))),
+    );
+  }
+}
+
+class RouteStepModel {
+  final String distanceText;
+  final int distanceValue;
+  final String durationText;
+  final int durationValue;
+  final LatLng endLocation;
+  final String htmlInstructions;
+  final String? maneuver;
+  final String polylinePoints;
+  final LatLng startLocation;
+  final String travelMode;
+
+  RouteStepModel({
+    required this.distanceText,
+    required this.distanceValue,
+    required this.durationText,
+    required this.durationValue,
+    required this.endLocation,
+    required this.htmlInstructions,
+    this.maneuver,
+    required this.polylinePoints,
+    required this.startLocation,
+    required this.travelMode,
+  });
+
+  factory RouteStepModel.fromJson(Map<String, dynamic> json) {
+    return RouteStepModel(
+      distanceText: json['distance']['text'],
+      distanceValue: json['distance']['value'],
+      durationText: json['duration']['text'],
+      durationValue: json['duration']['value'],
+      endLocation: LatLng(json['end_location']['lat'], json['end_location']['lng']),
+      htmlInstructions: json['html_instructions'],
+      maneuver: json['maneuver'],
+      polylinePoints: json['polyline']['points'],
+      startLocation: LatLng(json['start_location']['lat'], json['start_location']['lng']),
+      travelMode: json['travel_mode'],
+    );
+  }
+}
+import 'dart:math';
+
+import 'package:engeltanimam/constants/app_colors.dart';
+import 'package:engeltanimam/screens/map_screen.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:speech_to_text/speech_to_text.dart';
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  bool isOnay = false;
+  double level = 0.0;
+  double minSoundLevel = 50000;
+  double maxSoundLevel = -50000;
+  String lastWords = '';
+  String onayText = '';
+  String lastStatus = '';
+  String _currentLocaleId = '';
+  final SpeechToText speech = SpeechToText();
+  final FlutterTts flutterTts = FlutterTts();
+
+  @override
+  void initState() {
+    super.initState();
+    requestMicrophonePermission();
+  }
+
+  Future<void> requestMicrophonePermission() async {
+    var status = await Permission.microphone.request();
+    if (status.isGranted) {
+      // Mikrofon erişim izni verildi, konuşma tanıma işlemini başlatın
+      await initSpeechState();
+      await _speak(
+          "Merhaba, lütfen gideceğiniz yeri söyleyin ve ardından komutları takip edin");
+      startListening();
+      //stopListening();
+      //cancelListening();
+    } else if (status.isDenied) {
+      // Kullanıcı izni reddetti, uygun bir şekilde yanıt verin
+    } else if (status.isPermanentlyDenied) {
+      // Kullanıcı izni kalıcı olarak reddetti, ayarlara yönlendirin
+      openAppSettings();
+    }
+  }
+
+  // _HomeScreenState sınıfınızın dışına, resultListener fonksiyonunun altına
+  Future<void> _speak(String text) async {
+    await flutterTts.setLanguage("tr_TR"); // Tanınan dil
+    await flutterTts.speak(text);
+    await flutterTts
+        .awaitSpeakCompletion(true); // Seslendirme tamamlanana kadar bekleyin
+  }
+
+  Future<void> initSpeechState() async {
+    var hasSpeech = await speech.initialize(
+        onStatus: statusListener,
+        debugLogging: true,
+        finalTimeout: const Duration(milliseconds: 0));
+    if (hasSpeech) {
+
+      var systemLocale = await speech.systemLocale();
+      _currentLocaleId = systemLocale?.localeId ?? '';
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+          title: const Text("Anasayfa"),
+          backgroundColor: AppColors.headerTextColor,
+          actions: [
+            IconButton(
+                onPressed: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => MapsScreen(routeText: onayText),
+                      ),
+                    ),
+                icon: const Icon(Icons.add))
+          ]),
+      body: Column(children: [
+        Expanded(
+          child: Stack(
+            children: [
+              Container(
+                color: AppColors.primaryWhiteColor,
+                child: Center(
+                  child: Text(
+                    lastWords,
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ),
+              Positioned.fill(
+                bottom: 100,
+                child: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: InkWell(
+                    onTap: () => startListening(),
+                    child: Container(
+                      width: MediaQuery.sizeOf(context).width * .6,
+                      height: MediaQuery.sizeOf(context).width * .6,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        boxShadow: [
+                          BoxShadow(
+                              blurRadius: .26,
+                              spreadRadius: level * 1.5,
+                              color: Colors.black.withOpacity(.05))
+                        ],
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(62),
+                      ),
+                      child: Icon(
+                        Icons.mic,
+                        size: MediaQuery.sizeOf(context).width * .1,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Container(
+          padding: const EdgeInsets.symmetric(vertical: 20),
+          color: AppColors.primaryWhiteColor,
+          child: Center(
+            child: speech.isListening
+                ? const Text(
+                    "Dinliyorum.",
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  )
+                : const Text(
+                    'Dinlemiyorum',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  Future<void> startListening() async {
+    print("tıklandı");
+    lastWords = '';
+    await speech.listen(
+      onResult: resultListener,
+      listenFor: const Duration(seconds: 30),
+      pauseFor: const Duration(seconds: 5),
+      localeId: _currentLocaleId,
+      onSoundLevelChange: soundLevelListener,
+    );
+    setState(() {});
+  }
+
+  void stopListening() {
+    speech.stop();
+    setState(() {
+      level = 0.0;
+    });
+  }
+
+  void cancelListening() {
+    speech.cancel();
+    setState(() {
+      level = 0.0;
+    });
+  }
+
+  Future<void> resultListener(SpeechRecognitionResult result) async {
+    setState(() {
+      print("result' a geldik");
+      lastWords = '${result.recognizedWords} - ${result.finalResult}';
+    });
+    if (result.finalResult) {
+      if (isOnay &&
+          result.recognizedWords.toUpperCase() == "Onaylıyorum".toUpperCase() &&
+          onayText != '') {
+        setState(() {});
+        isOnay = false;
+        await Future.delayed(const Duration(seconds: 1));
+        await _speak(
+                "İşleminiz gerçekleştirildi şimdi rotanız oluşturuluyor lütfen bekleyiniz.")
+            .then(
+          (value) => Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => MapsScreen(routeText: onayText),
+            ),
+          ),
+        );
+      } else {
+        setState(() {});
+        isOnay = true;
+        onayText = result.recognizedWords;
+        await Future.delayed(const Duration(seconds: 1));
+        await _speak(
+            "${result.recognizedWords} mu demek isteediniz eğer doğru ise onaylıyorum  diyiniz değil ise başka bir şey deyiniz");
+        await startListening();
+        return;
+      }
+      print("bitti");
+    } else {
+      print("daha ses aktf");
+    }
+  }
+
+  void soundLevelListener(double level) {
+    minSoundLevel = min(minSoundLevel, level);
+    maxSoundLevel = max(maxSoundLevel, level);
+    // _logEvent('sound level $level: $minSoundLevel - $maxSoundLevel ');
+    setState(() {
+      this.level = level;
+      print("sound level dinleniyor $level");
+    });
+  }
+
+  void statusListener(String status) {
+    setState(() {
+      lastStatus = status;
+    });
+  }
+}
+
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+
+import '../constants/app_colors.dart';
+import '../cubit/map_cubit.dart';
+import '../widget/route_response_widget.dart';
+
+class MapsScreen extends StatefulWidget {
+  final String routeText;
+
+  const MapsScreen({super.key, required this.routeText});
+
+  @override
+  State<MapsScreen> createState() => _MapsScreenState();
+}
+
+class _MapsScreenState extends State<MapsScreen>
+    with SingleTickerProviderStateMixin, MapsScreenMixin {
+  @override
+  void initState() {
+    super.initState();
+    animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 500),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return BlocProvider(
+      create: (context) =>
+          MapCubit(context, "kocaeli üniversitesi b kapısı", animationController),
+      child: BlocBuilder<MapCubit, MapState>(
+        builder: (context, state) {
+          return buildScaffold(context);
+        },
+      ),
+    );
+  }
+}
+
+mixin MapsScreenMixin {
+  late GoogleMapController mapController;
+  late AnimationController animationController;
+  TextEditingController myLocationController = TextEditingController();
+  TextEditingController locationController = TextEditingController();
+
+  void _onMapCreated(GoogleMapController controller, BuildContext context) {
+    print("om map created");
+    mapController = controller;
+    context.read<MapCubit>().mapsControllerInitalize(mapController);
+  }
+
+  Scaffold buildScaffold(BuildContext context) {
+    return Scaffold(
+      body: Stack(children: [
+        !context.watch<MapCubit>().isLoading
+            ? googleMap(context)
+            : const Center(child: CircularProgressIndicator()),
+        taxiTopInfo(context),
+        SafeArea(
+          child: IconButton(
+            icon: const Icon(Icons.arrow_back_outlined, color: Colors.black),
+            onPressed: () => Navigator.pop(context),
+          ),
+        ),
+        Align(
+          alignment: Alignment.bottomCenter,
+          child: Container(
+              padding: const EdgeInsets.all(12),
+              color: Colors.red,
+              child: Text(
+                context.watch<MapCubit>().directionMessage,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 24),
+                textAlign: TextAlign.center,
+              )),
+        ),
+      ]),
+    );
+  }
+
+  GoogleMap googleMap(BuildContext context) {
+    LatLng target = LatLng(context.read<MapCubit>().currentLocation!.latitude!,
+        context.read<MapCubit>().currentLocation!.longitude!);
+    return GoogleMap(
+      onMapCreated: (controller) => _onMapCreated(controller, context),
+      initialCameraPosition: CameraPosition(target: target, zoom: 11.0),
+      markers: context.watch<MapCubit>().allMarkers,
+      polylines: Set<Polyline>.of(context.watch<MapCubit>().polylines.values),
+      myLocationEnabled: true,
+      myLocationButtonEnabled: true,
+    );
+  }
+
+  Widget taxiTopInfo(BuildContext context) {
+    return Visibility(
+      visible: context.watch<MapCubit>().result != null,
+      child: Positioned(
+        top: 0,
+        right: 0,
+        left: 0,
+        child: SafeArea(
+          child:
+              RouteResponseWidget(response: context.watch<MapCubit>().result),
+        ),
+      ),
+    );
+  }
+
+  Visibility topInfo(BuildContext context) {
+    return Visibility(
+      visible: MediaQuery.of(context).viewInsets.bottom <= 0 &&
+          context.watch<MapCubit>().result != null,
+      child: const Positioned(
+        top: 0,
+        right: 0,
+        left: 0,
+        child: SafeArea(
+          child: Stack(
+            children: [
+              Padding(
+                padding: EdgeInsets.all(24),
+                child: Align(
+                    alignment: Alignment.centerRight,
+                    child: Icon(
+                      Icons.close,
+                      color: AppColors.headerTextColor,
+                      size: 18,
+                    )),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+import 'package:engeltanimam/models/route_response_model.dart';
+import 'package:flutter/material.dart';
+
+import '../constants/app_colors.dart';
+
+class RouteResponseWidget extends StatefulWidget {
+  final RouteResponseModel? response;
+
+  const RouteResponseWidget({Key? key, required this.response})
+      : super(key: key);
+
+  @override
+  State<RouteResponseWidget> createState() => _RouteResponseWidgetState();
+}
+
+class _RouteResponseWidgetState extends State<RouteResponseWidget>
+    with SingleTickerProviderStateMixin {
+  bool isMoreVisible = false;
+  late AnimationController animationController;
+
+  @override
+  void initState() {
+    super.initState();
+    animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 500),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.response != null) {
+      return responseWidget();
+    }
+    return SizedBox.fromSize();
+  }
+
+  Widget responseWidget() {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        children: widget.response!.steps.map((e) {
+          return listItemWidget(e);
+        }).toList(),
+      ),
+    );
+  }
+
+  Container listItemWidget(RouteStepModel e) {
+    return Container(
+      width: MediaQuery.sizeOf(context).width - 24,
+      padding: const EdgeInsets.all(12),
+      margin: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.red.withOpacity(.7),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: const [
+          BoxShadow(
+              offset: Offset(4, 0),
+              color: Colors.white,
+              blurRadius: 10,
+              spreadRadius: 1)
+        ],
+      ),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Flexible(
+                flex: 2,
+                child: Container(
+                  padding:
+                  const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                  decoration: BoxDecoration(
+                      color: AppColors.primaryWhiteColor,
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(color: Colors.grey.shade300)),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const SizedBox(height: 12),
+                      topInfoTextWidget("Rota"),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: Text(e.durationText.toString(),
+                                style: const TextStyle(
+                                    fontSize: 24,
+                                    color: Colors.red,
+                                    fontWeight: FontWeight.bold),
+                                overflow: TextOverflow.visible,
+                                maxLines: 1),
+                          ),
+                          const SizedBox(width: 6),
+                          Text("(${e.distanceText})",
+                              style: TextStyle(
+                                  color: Colors.grey.shade700, fontSize: 14)),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      walkWidget(e.htmlInstructions),
+                      const SizedBox(height: 12)
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Flexible(
+                flex: 1,
+                child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          mainAxisAlignment: MainAxisAlignment.start,
+                          children: [
+                            topInfoTextWidget("Tahmini varış süresi"),
+                            const SizedBox(height: 12),
+                            FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: Text(
+                                widget.response!.duration,
+                                style: const TextStyle(
+                                    fontSize: 26,
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            Text("(${widget.response!.distance})",
+                                style: TextStyle(
+                                    color: Colors.grey.shade700, fontSize: 14))
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        InkWell(
+                          onTap: () {
+                            setState(() {
+                              isMoreVisible = !isMoreVisible;
+                            });
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                                color: AppColors.primaryWhiteColor,
+                                borderRadius: BorderRadius.circular(12),
+                                border:
+                                Border.all(color: Colors.grey.shade300)),
+                            child: Text(
+                              isMoreVisible ? "Daha az " : "Daha fazlası",
+                              style: const TextStyle(
+                                  fontSize: 14,
+                                  color: Colors.red,
+                                  fontWeight: FontWeight.bold),
+                              textAlign: TextAlign.center,
+                            ),
+                          ),
+                        ),
+                      ],
+                    )),
+              )
+            ],
+          ),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 500),
+            curve: Curves.ease,
+            reverseDuration: Duration.zero,
+            child: AnimatedOpacity(
+              opacity: isMoreVisible ? 1.0 : 0.0,
+              duration: const Duration(milliseconds: 500),
+              curve: Curves.easeInOut,
+              child: SlideTransition(
+                position: Tween<Offset>(
+                  begin: const Offset(0.0, 0.0),
+                  end: Offset.zero,
+                ).animate(CurvedAnimation(
+                  parent: animationController,
+                  curve: Curves.linear,
+                )),
+                child: Visibility(
+                  visible: isMoreVisible,
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      children: widget.response!.steps.map((e) {
+                        return Column(
+                          children: [
+                            const SizedBox(height: 6),
+                            walkWidget(e.htmlInstructions),
+                            const SizedBox(height: 6),
+                            const Divider(thickness: 2,)
+                          ],
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Text topInfoTextWidget(String text) {
+    return Text("$text:",
+        style: TextStyle(color: Colors.grey.shade700, fontSize: 14));
+  }
+
+  Row walkWidget(String text) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisAlignment: MainAxisAlignment.start,
+      children: [
+        Icon(
+          Icons.directions_walk,
+          size: 16,
+          color: Colors.grey.shade800,
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            text,
+            style: TextStyle(color: Colors.grey.shade800, fontSize: 14),
+          ),
+        ),
+      ],
+    );
+  }
+}import 'package:flutter/material.dart';
+
+class Responsive extends StatelessWidget {
+  final Widget mobile;
+  final Widget? tablet;
+  final Widget desktop;
+
+  const Responsive({
+    Key? key,
+    required this.mobile,
+    this.tablet,
+    required this.desktop,
+  }) : super(key: key);
+
+  static bool isMobile(BuildContext context) =>
+      MediaQuery.of(context).size.width < 576;
+
+  static bool isTablet(BuildContext context) =>
+      MediaQuery.of(context).size.width >= 576 &&
+      MediaQuery.of(context).size.width <= 992;
+
+  static bool isDesktop(BuildContext context) =>
+      MediaQuery.of(context).size.width > 992;
+
+  @override
+  Widget build(BuildContext context) {
+    final Size size = MediaQuery.of(context).size;
+    if (size.width > 992) {
+      return desktop;
+    } else if (size.width >= 576 && tablet != null) {
+      return tablet!;
+    } else {
+      return mobile;
+    }
+  }
+}
+import 'dart:ui';
+
+/// Encapsulates constants for some common colors.
+abstract class AppColors {
+  static const headerTextColor = Color(0xFF466994);
+  static const secondaryAccent = Color(0xFF3b67b5);
+  static const primaryWhiteColor = Color(0xFFF7F7F7);
+  static const categoryColor1 = Color(0xFFffd084);
+  static const categoryColor2 = Color(0xFFb2f0fb);
+  static const categoryColor3 = Color(0xFFfddddc);
+}
+import 'package:flutter/material.dart';
+import 'app_colors.dart';
+
+//const kPrimaryColor = Color(0xFF6F35A5);
+const kPrimaryColor = AppColors.secondaryAccent;
+//const kPrimaryLightColor = Color(0xFFF1E6FF);
+const kPrimaryLightColor = Color(0x253b67b5);
+
+const double defaultPadding = 16.0;
+import 'package:engeltanimam/screens/home_screen.dart';
+import 'package:flutter/material.dart';
+
+import 'constants/app_colors.dart';
+import 'constants/constants.dart';
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  // This widget is the root of your application.
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Flutter Demo',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+          brightness: Brightness.light,
+          primaryColor: AppColors.primaryWhiteColor,
+          scaffoldBackgroundColor: Colors.white,
+          canvasColor: const Color(0xFFCADCF8),
+          backgroundColor: AppColors.primaryWhiteColor,
+          elevatedButtonTheme: ElevatedButtonThemeData(
+            style: ElevatedButton.styleFrom(
+              elevation: 0,
+              foregroundColor: Colors.white,
+              backgroundColor: kPrimaryColor,
+              shape: const StadiumBorder(),
+              maximumSize: const Size(double.infinity, 56),
+              minimumSize: const Size(double.infinity, 56),
+            ),
+          ),
+          inputDecorationTheme: const InputDecorationTheme(
+            filled: true,
+            fillColor: kPrimaryLightColor,
+            iconColor: kPrimaryColor,
+            prefixIconColor: kPrimaryColor,
+            contentPadding: EdgeInsets.symmetric(
+                horizontal: defaultPadding, vertical: defaultPadding),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.all(Radius.circular(30)),
+              borderSide: BorderSide.none,
+            ),
+          ),
+          textTheme: const TextTheme(
+              headline1: TextStyle(
+                  color: AppColors.headerTextColor,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 28),
+              headline2:
+                  TextStyle(color: AppColors.headerTextColor, fontSize: 24),
+              headline3: TextStyle(
+                  color: AppColors.primaryWhiteColor,
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold)),
+          appBarTheme: const AppBarTheme(
+              backgroundColor: Color(0xFFCADCF8), elevation: 0)),
+      home: const HomeScreen(),
+    );
+  }
+}
+name: engeltanimam
+description: A new Flutter project.
+
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.1.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dio: ^5.4.1
+  http: ^1.0.0
+  google_maps_flutter: ^2.5.3
+  flutter_polyline_points: ^2.0.0
+  location: ^5.0.3
+  flutter_bloc: ^8.1.4
+  shared_preferences: ^2.2.3
+  lottie: ^2.7.0
+  speech_to_text: ^6.6.0
+  permission_handler: ^9.1.0
+  flutter_tts: ^3.3.0
+  geolocator: ^11.0.0
+  vibration: ^1.7.3
+
+  cupertino_icons: ^1.0.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+   - assets/location.png
